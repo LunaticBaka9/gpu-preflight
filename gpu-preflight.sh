@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  gpu-preflight.sh — Linux 游戏启动前体检（重点覆盖 NVIDIA + Proton）
+#  gpu-preflight.sh — Linux 游戏启动前体检（NVIDIA / AMD / SteamOS / Proton / Flatpak Steam）
 #
 #  设计目标：与具体游戏无关。
 #    · 默认只体检系统层面：驱动内核态、显存/内存、Vulkan 设备可见性
@@ -39,39 +39,49 @@
 #        这样命令行环境变量依然优先。
 #        可用变量：VRAM_WARN_MIB、VRAM_WARN_PCT、RAM_MIN_MIB、SWAP_WARN_MIB、
 #                  JOURNAL_ARGS（默认 "-b -k"，可设 "-b -1 -k" 检查上一次开机）、
-#                  STEAM_DIR、STEAM_USERDATA、XID_SERIOUS
+#                  STEAM_DIR、STEAM_USERDATA、XID_SERIOUS、OS_RELEASE_FILE
 #
 #  发行版兼容性：
 #    · 需要 bash（用到进程替换 / here-string；bash 4+ 更稳）、coreutils、grep、awk、sed、
 #      sort、uniq、cut、tr。awk 只用 POSIX 特性，gawk / mawk(Debian) / BusyBox awk(Alpine) 都能跑。
+#    · 专门适配了两类环境：
+#        1) SteamOS / Steam Deck（不可变系统、AMD APU、zram）：
+#           - 驱动检查会自动切换到 amdgpu 分支（GPU reset / MES / ring timeout / 页错误）
+#           - zram 占用高不再误报（结合可用内存判断）
+#           - 提示不要手动改 /usr（改动会被系统更新抹掉），并显示 steamos-readonly 状态
+#        2) Flatpak 版 Steam（com.valvesoftware.Steam）：
+#           - 自动探测 ~/.var/app/com.valvesoftware.Steam/data/Steam 与 .local/share/Steam
+#           - compatdata/Proton 前缀在 Flatpak 自己的 Steam 目录里查找
+#           - -l 启动时优先用 flatpak run，其次 steam -applaunch，最后 xdg-open steam://
+#        原生 Steam 与 Flatpak Steam 可以同时存在：脚本会全部扫描，并注明每个游戏来自哪个根目录
 #    · 内核日志：有 systemd 就用 journalctl（支持 -b / -b -1 看上一次开机）；
 #      没有 systemd（Void、Artix、Alpine 等）自动退回 dmesg —— 注意非 root 读 dmesg
-#      需要 kernel.dmesg_restrict=0，否则该项会提示跳过。
+#      需要 kernel.dmesg_restrict=0，否则该项会提示"没做"（不代表有问题）。
 #    · 读的都是内核标准接口（/proc/driver/nvidia、/proc/meminfo、/sys/class/drm），
-#      所以 Debian/Ubuntu、Fedora/RHEL、Arch/CachyOS、openSUSE、Alpine 等都能用；
-#      检查的可执行文件只按“命令是否存在”判断，不依赖任何包管理器。
+#      所以 Debian/Ubuntu、Fedora/RHEL、Arch/CachyOS、openSUSE、Alpine、SteamOS 都能用；
+#      检查的可执行文件只按"命令是否存在"判断，不依赖任何包管理器，也不写任何文件
+#      （在只读根文件系统上同样可用）。
 #    · 可选依赖（缺了只跳过对应检查，不影响其它项）：
-#        nvidia-smi（显存）、vulkaninfo/vulkan-tools（Vulkan 枚举）、lspci/pciutils（拓扑）、
+#        nvidia-smi（NVIDIA 显存）、vulkaninfo/vulkan-tools（Vulkan 枚举）、lspci/pciutils（拓扑）、
 #        python3（解析 Steam shortcuts.vdf，只有 --game/--all-games/--list-games 需要）、
-#        timeout（coreutils，给 vulkaninfo 加超时）。
-#    · Steam 安装位置自动探测：~/.local/share/Steam、~/.steam/steam、
-#      Flatpak 版 ~/.var/app/com.valvesoftware.Steam/data/Steam（可用 STEAM_DIR 指定）。
-#    · 平台范围：检查项偏 NVIDIA + Proton；AMD/Intel 平台仍做内存与 Vulkan 检查，
-#      NVIDIA 专属项会明确提示“未检测到 NVIDIA 驱动”。
+#        timeout（coreutils，给 vulkaninfo 加超时）、steam / flatpak / xdg-open（仅 -l 启动用）。
+#    · 平台范围：NVIDIA 与 AMD/amdgpu 驱动检查都支持；Intel 平台仍做内存与 Vulkan 检查，
+#      驱动专属项会明确提示"未检测到"。
+#    · 调试用环境变量：OS_RELEASE_FILE（默认 /etc/os-release）、FORCE_GPU=auto|nvidia|amd
+#      （强制走某个驱动分支，便于在容器/特殊模块名环境下验证）。
 # ============================================================================
 set -uo pipefail
 
 # ----------------------------------------------------------------- 默认值
-# Steam 目录：优先用户显式指定，其次自动探测常见位置（含 Flatpak）
-if [ -z "${STEAM_DIR:-}" ]; then
-    for _cand in "$HOME/.local/share/Steam" "$HOME/.steam/steam" \
-                 "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
-        [ -d "$_cand/steamapps" ] && { STEAM_DIR="$_cand"; break; }
-    done
-    STEAM_DIR="${STEAM_DIR:-$HOME/.local/share/Steam}"
-fi
+# Steam 安装位置：支持原生 Steam、SteamOS/Steam Deck 默认路径、以及 Flatpak 版 Steam
+#   · STEAM_DIR 指定后只扫这一个；否则自动探测下面所有候选（多装可共存，全部扫）
+#   · STEAM_USERDATA 可选：指定 userdata 数字目录（多账号时避免扫错）
+STEAM_DIR="${STEAM_DIR:-}"
 STEAM_USERDATA="${STEAM_USERDATA:-}"
-SHORTCUTS_VDF=""
+STEAM_ROOTS=()                 # 探测到的所有 Steam 根目录（去重、真实路径）
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
+FORCE_GPU="${FORCE_GPU:-auto}"      # auto（默认）| nvidia | amd：强制走某个驱动分支（调试/特殊环境）
+IS_STEAMOS=0
 
 VRAM_WARN_MIB="${VRAM_WARN_MIB:-2000}"     # 空闲时显存占用超过此值 → 疑似泄漏
 VRAM_WARN_PCT="${VRAM_WARN_PCT:-80}"       # 显存占用超过此百分比 → 警告
@@ -80,22 +90,59 @@ SWAP_WARN_MIB="${SWAP_WARN_MIB:-4096}"     # 交换已用超过此值 → 警告
 JOURNAL_ARGS="${JOURNAL_ARGS:--b -k}"      # 默认只看本次开机
 XID_SERIOUS="${XID_SERIOUS:-48 56 62 74 79 94 95 109 119 120}"
 
-# 致命：GPU channel / GSP 分配失败 —— 这是 “D3D12 设备建不出来” 的直接原因
+# NVIDIA：致命 = GPU channel / GSP 分配失败（“D3D12 设备建不出来” 的直接原因）
 NVRM_CRIT_RE='kchangrpapi|GspRmAlloc'
-# 警告：分配真的失败 / VA 空间坏掉。注意不能只匹配 NV_ERR_NO_MEMORY：单独一条
+# NVIDIA 警告：分配真的失败 / VA 空间坏掉。不能只匹配 NV_ERR_NO_MEMORY：单独一条
 #       “大页失败后改用默认页重试” 是良性瞬时事件（本机实测出现过），会误报。
 NVRM_WARN_RE='dmaAllocMapping|gvaspaceMapping|gpu_vaspace[.]c|virt_mem_allocator|system_mem[.]c|nv_gpu_ops[.]c|pmaAllocatePages|ctxBufPoolReserve|nvAssert(Ok)?Failed.*[Oo]ut of memory'
+
+# AMD/amdgpu（SteamOS、Steam Deck、AMD 显卡）：致命 = GPU 复位 / MES 无响应；
+# 警告 = ring 超时、页错误（可能是软恢复，也可能是黑屏前兆）
+AMD_CRIT_RE='amdgpu.*(GPU reset|MES.*(failed|timeout)|failed to respond to msg|GPU hang|hardware error|Fence fallback timer expired|flushed .*timeout|Resetting .*ring)'
+AMD_WARN_RE='amdgpu.*(ring .*timeout|PROTECTION_FAULT|no-retry page fault|page fault|soft recovered|SMU.*(failed|timeout)|PSP.*(failed|timeout)|ip block.*timeout)'
 
 CONF_FILE="${GPU_PREFLIGHT_CONF:-$HOME/.config/gpu-preflight.conf}"
 [ -r "$CONF_FILE" ] && . "$CONF_FILE"
 
-# 自动找 Steam userdata 目录（哪个里面有 shortcuts.vdf 就用哪个）
-if [ -z "$STEAM_USERDATA" ]; then
-    for d in "$STEAM_DIR"/userdata/*/config/shortcuts.vdf; do
-        [ -r "$d" ] && STEAM_USERDATA="$(basename "$(dirname "$(dirname "$d")")")"
+# 探测所有 Steam 根目录（去重；.steam/steam 常是指向 .local/share/Steam 的软链）
+detect_steam_roots() {
+    local cand real seen
+    for cand in "$STEAM_DIR" \
+                "$HOME/.local/share/Steam" \
+                "$HOME/.steam/steam" \
+                "$HOME/.steam/root" \
+                "$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
+                "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+        [ -n "$cand" ] || continue
+        [ -d "$cand/steamapps" ] || continue
+        real="$(readlink -f "$cand" 2>/dev/null || printf '%s' "$cand")"
+        for seen in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
+            [ "$seen" = "$real" ] && continue 2
+        done
+        STEAM_ROOTS+=("$real")
     done
-fi
-[ -n "$STEAM_USERDATA" ] && SHORTCUTS_VDF="$STEAM_DIR/userdata/$STEAM_USERDATA/config/shortcuts.vdf"
+}
+
+# 给根目录打标签（输出用）
+steam_root_kind() {
+    case "$1" in
+        */.var/app/com.valvesoftware.Steam/*) printf 'Flatpak Steam' ;;
+        *) [ "$IS_STEAMOS" = 1 ] && printf 'SteamOS 内置 Steam' || printf '原生 Steam' ;;
+    esac
+}
+
+# 取某个根目录下的 shortcuts.vdf（可用 STEAM_USERDATA 指定账号）
+vdf_of_root() {
+    local root="$1" d
+    if [ -n "$STEAM_USERDATA" ] && [ -r "$root/userdata/$STEAM_USERDATA/config/shortcuts.vdf" ]; then
+        printf '%s/userdata/%s/config/shortcuts.vdf' "$root" "$STEAM_USERDATA"
+        return 0
+    fi
+    for d in "$root"/userdata/*/config/shortcuts.vdf; do
+        [ -r "$d" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
 
 # ----------------------------------------------------------------- 运行状态
 CRITICAL=0
@@ -109,6 +156,7 @@ QUIET=0
 VERBOSE=0
 SKIP_VULKAN=0
 LAUNCH_APPID=""
+LAUNCH_ROOT=""
 
 # ----------------------------------------------------------------- 输出
 if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
@@ -168,9 +216,19 @@ check_env() {
     sec "1. 环境与显卡拓扑"
 
     local distro kernel
-    distro="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null)"
+    distro="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' "$OS_RELEASE_FILE" 2>/dev/null)"
     kernel="$(uname -r)"
     note "系统: ${distro:-未知}　内核: $kernel"
+
+    # SteamOS / Steam Deck 特有提示
+    if [ "$IS_STEAMOS" = 1 ]; then
+        info "检测到 SteamOS / Steam Deck（不可变系统）"
+        note "驱动与组件来自系统镜像：不要手动改 /usr（改动会在系统更新后消失，还可能影响开机）"
+        note "要更新驱动/Proton：走 设置 → 系统更新（可切 Beta 通道），或在 Steam 里改 Proton 版本"
+        if have steamos-readonly; then
+            vnote "steamos-readonly: $(steamos-readonly status 2>/dev/null)"
+        fi
+    fi
 
     if have lspci; then
         while IFS= read -r g; do vnote "GPU: $g"; done \
@@ -179,6 +237,9 @@ check_env() {
 
     if [ -r /proc/driver/nvidia/version ]; then
         note "NVIDIA 内核模块: $(head -1 /proc/driver/nvidia/version | sed 's/  */ /g')"
+    fi
+    if [ -d /sys/module/amdgpu ]; then
+        vnote "amdgpu 模块已加载"
     fi
     if [ -r /sys/module/nvidia_drm/parameters/modeset ]; then
         vnote "nvidia_drm: modeset=$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null) fbdev=$(cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
@@ -212,76 +273,115 @@ check_env() {
 }
 
 # ============================================================ 2. 驱动内核态
-check_driver() {
-    sec "2. NVIDIA 驱动内核态"
+# 统计并抽取样例行：结果放全局 SCAN_CRIT / SCAN_WARN / SCAN_FIRST / SCAN_SAMPLES
+# $1=致命正则  $2=警告正则  （依赖 check_driver 里准备好的 $DUMP / $KLOG_SOURCE）
+scan_set() {
+    local re="$1|$2"
+    SCAN_CRIT="$(printf '%s\n' "$DUMP" | grep -cE "$1" || true)"
+    SCAN_WARN="$(printf '%s\n' "$DUMP" | grep -cE "$2" || true)"
+    # 用 awk 而不是 grep|head：管道被 head 提前关闭会刷“断开的管道”警告；
+    # awk 也不提前 exit（否则写大段日志的 printf 会报 EPIPE）。
+    # 时间戳格式 journalctl 与 dmesg 不同，按来源分别取。
+    SCAN_FIRST="$(printf '%s\n' "$DUMP" | awk -v re="$re" -v src="$KLOG_SOURCE" \
+                  '$0 ~ re && !got { if (src == "dmesg") print $1; else print $1, $2, $3; got = 1 }')"
+    SCAN_SAMPLES="$(printf '%s\n' "$DUMP" | awk -v re="$re" -v src="$KLOG_SOURCE" \
+                    '$0 ~ re && n < 2 { sub(/.*kernel: /, ""); if (src == "dmesg") sub(/^\[[^]]*\][ ]*/, "");
+                                        print substr($0, 1, 110); n++ }')"
+}
 
-    # 没有 NVIDIA 驱动就别硬套这项（AMD/Intel 平台）
-    if [ ! -r /proc/driver/nvidia/version ] && ! have nvidia-smi; then
-        info "未检测到 NVIDIA 驱动（本检查项针对 NVIDIA；AMD/Intel 平台可忽略）"
+show_samples() {
+    printf '%s\n' "${SCAN_SAMPLES:-}" | while IFS= read -r l; do [ -n "$l" ] && note "证据: $l"; done
+}
+
+check_driver() {
+    sec "2. 显卡驱动内核态"
+
+    local has_nv=0 has_amd=0
+    { [ -r /proc/driver/nvidia/version ] || have nvidia-smi; } && has_nv=1
+    { [ -d /sys/module/amdgpu ] || grep -q '^amdgpu ' /proc/modules 2>/dev/null; } && has_amd=1
+    case "${FORCE_GPU:-auto}" in
+        nvidia) has_nv=1; has_amd=0 ;;
+        amd)    has_nv=0; has_amd=1 ;;
+    esac
+
+    if [ "$has_nv" = 0 ] && [ "$has_amd" = 0 ]; then
+        info "未检测到 NVIDIA / AMD 独立驱动（本检查项针对这两类；Intel 平台可忽略）"
         return
     fi
 
     # 取内核日志：优先 journald（支持 -b / -b -1 看上一次开机），
     # 没有 systemd（Void/Artix/Alpine…）或 journal 未持久化时退回 dmesg。
     # 注意：赋值必须写在调用方（函数里的全局赋值放进 $() 会丢，因为那是子 shell）。
-    local dump="" KLOG_SOURCE=""
+    DUMP="" KLOG_SOURCE=""
     if have journalctl; then
-        dump="$(journalctl $JOURNAL_ARGS --no-pager 2>/dev/null || true)"
-        [ -n "$dump" ] && KLOG_SOURCE="journalctl $JOURNAL_ARGS"
+        DUMP="$(journalctl $JOURNAL_ARGS --no-pager 2>/dev/null || true)"
+        [ -n "$DUMP" ] && KLOG_SOURCE="journalctl $JOURNAL_ARGS"
     fi
-    if [ -z "$dump" ] && have dmesg; then
-        dump="$(dmesg 2>/dev/null || true)"
-        [ -n "$dump" ] && KLOG_SOURCE="dmesg"
+    if [ -z "$DUMP" ] && have dmesg; then
+        DUMP="$(dmesg 2>/dev/null || true)"
+        [ -n "$DUMP" ] && KLOG_SOURCE="dmesg"
     fi
-    if [ -z "$dump" ]; then
+    if [ -z "$DUMP" ]; then
         warn "无法读取内核日志 → 这项检查没做（不代表有问题，只是无法判定）"
         note "常见原因：非 systemd 发行版且非 root（kernel.dmesg_restrict=1），或 journal 未持久化"
-        note "可试：sudo dmesg | grep -E 'NVRM'　或　把 kernel.dmesg_restrict 设为 0"
+        note "可试：sudo dmesg | grep -E 'NVRM|amdgpu'　或　把 kernel.dmesg_restrict 设为 0"
         return
     fi
     note "内核日志来源: $KLOG_SOURCE"
 
-    # 用 awk 而不是 grep|head：管道被 head 提前关闭会刷一堆“断开的管道”警告；
-    # awk 这里也不提前 exit（否则写大段日志的 printf 会报 EPIPE）。
-    # 时间戳格式在 journalctl 与 dmesg 下不同，按来源分别取。
-    local crit memerr first samples
-    crit="$(printf '%s\n' "$dump" | grep -cE "$NVRM_CRIT_RE" || true)"
-    memerr="$(printf '%s\n' "$dump" | grep -cE "$NVRM_WARN_RE" || true)"
-    first="$(printf '%s\n' "$dump" | awk -v re="$NVRM_CRIT_RE|$NVRM_WARN_RE" -v src="$KLOG_SOURCE" \
-             '$0 ~ re && !got { if (src == "dmesg") print $1; else print $1, $2, $3; got = 1 }')"
-    samples="$(printf '%s\n' "$dump" | awk -v re="$NVRM_CRIT_RE|$NVRM_WARN_RE" -v src="$KLOG_SOURCE" \
-               '$0 ~ re && n < 2 { sub(/.*kernel: /, ""); if (src == "dmesg") sub(/^\[[^]]*\][ ]*/, "");
-                                   print substr($0, 1, 110); n++ }')"
+    # ---------------- NVIDIA ----------------
+    if [ "$has_nv" = 1 ]; then
+        vnote "检查 NVIDIA（NVRM / Xid）"
+        scan_set "$NVRM_CRIT_RE" "$NVRM_WARN_RE"
+        note "NVIDIA：channel/GSP 分配失败 ${SCAN_CRIT} 条　内存/VA 空间异常 ${SCAN_WARN} 条"
+        if [ "${SCAN_CRIT:-0}" -gt 0 ]; then
+            bad "NVIDIA 驱动已损坏：GPU channel / GSP 分配失败 ${SCAN_CRIT} 条（最早 ${SCAN_FIRST}）"
+            show_samples
+            note "后果：vkd3d-proton 建不出 D3D12 设备 → D3D12 游戏黑屏（有声音）"
+            note "而且每启动一次都会往坏掉的地址空间再叠一批映射，只会更糟 → 先重启"
+        elif [ "${SCAN_WARN:-0}" -gt 0 ]; then
+            warn "NVIDIA 驱动出现内存/VA 空间异常 ${SCAN_WARN} 条（最早 ${SCAN_FIRST}）"
+            show_samples
+            note "还没到致命那一步，但继续跑很可能恶化；建议先重启再玩"
+        else
+            ok "NVIDIA 驱动内核态干净：没有 NVRM 分配/映射错误"
+        fi
 
-    note "channel/GSP 分配失败: ${crit} 条　内存/VA 空间异常: ${memerr} 条"
-    if [ "${crit:-0}" -gt 0 ]; then
-        bad "驱动已损坏：GPU channel / GSP 分配失败 ${crit} 条（最早 ${first}）"
-        printf '%s\n' "$samples" | while IFS= read -r l; do [ -n "$l" ] && note "证据: $l"; done
-        note "后果：vkd3d-proton 建不出 D3D12 设备 → D3D12 游戏黑屏（有声音）"
-        note "而且每启动一次都会往坏掉的地址空间再叠一批映射，只会更糟 → 先重启"
-    elif [ "${memerr:-0}" -gt 0 ]; then
-        warn "驱动出现内存/VA 空间异常 ${memerr} 条（最早 ${first}）"
-        printf '%s\n' "$samples" | while IFS= read -r l; do [ -n "$l" ] && note "证据: $l"; done
-        note "还没到致命那一步，但继续跑很可能恶化；建议先重启再玩"
-    else
-        ok "驱动内核态干净：没有 NVRM 分配/映射错误"
+        # Xid（NVIDIA GPU 故障码）
+        local xid_raw codes
+        xid_raw="$(printf '%s\n' "$DUMP" | grep -oE 'Xid[^)]*\): [0-9]+' | awk -F': ' '{print $NF}')"
+        if [ -n "$xid_raw" ]; then
+            codes="$(printf '%s\n' "$xid_raw" | sort -n | uniq -c | awk '{printf "%s×%s ", $2, $1}')"
+            local serious_hit=""
+            while IFS= read -r c; do
+                [ -n "$c" ] && xid_is_serious "$c" && serious_hit="$serious_hit $c"
+            done <<<"$xid_raw"
+            if [ -n "$serious_hit" ]; then
+                warn "本次出现过严重 GPU 故障码 Xid:$(printf '%s' "$serious_hit" | tr ' ' '\n' | sort -nu | tr '\n' ' ')"
+                note "全部 Xid 统计: $codes"
+                note "建议重启后再玩；若反复出现，多半是驱动/电源管理问题（查 dmesg 与 NVIDIA 论坛）"
+            else
+                note "Xid 记录: $codes（非严重码，通常是应用侧问题）"
+            fi
+        fi
     fi
 
-    # Xid（GPU 故障码）
-    local xid_raw codes
-    xid_raw="$(printf '%s\n' "$dump" | grep -oE 'Xid[^)]*\): [0-9]+' | awk -F': ' '{print $NF}')"
-    if [ -n "$xid_raw" ]; then
-        codes="$(printf '%s\n' "$xid_raw" | sort -n | uniq -c | awk '{printf "%s×%s ", $2, $1}')"
-        local serious_hit=""
-        while IFS= read -r c; do
-            [ -n "$c" ] && xid_is_serious "$c" && serious_hit="$serious_hit $c"
-        done <<<"$xid_raw"
-        if [ -n "$serious_hit" ]; then
-            warn "本次出现过严重 GPU 故障码 Xid:$(printf '%s' "$serious_hit" | tr ' ' '\n' | sort -nu | tr '\n' ' ')"
-            note "全部 Xid 统计: $codes"
-            note "建议重启后再玩；若反复出现，多半是驱动/电源管理问题（查 dmesg 与 NVIDIA 论坛）"
+    # ---------------- AMD / amdgpu（SteamOS、Steam Deck、AMD 独显/核显）----------------
+    if [ "$has_amd" = 1 ]; then
+        vnote "检查 AMD（amdgpu）"
+        scan_set "$AMD_CRIT_RE" "$AMD_WARN_RE"
+        note "AMD：GPU reset / MES 失败 ${SCAN_CRIT} 条　ring 超时/页错误 ${SCAN_WARN} 条"
+        if [ "${SCAN_CRIT:-0}" -gt 0 ]; then
+            bad "amdgpu 出现 GPU 复位 / MES 无响应 ${SCAN_CRIT} 条（最早 ${SCAN_FIRST}）"
+            show_samples
+            note "GPU 一旦复位过，本次开机内经常继续出错（黑屏/掉驱动）→ 建议先重启再玩"
+            note "SteamOS/Deck 上这类问题多与驱动版本或超频/功耗设置有关；重启后先别加载超频工具"
+        elif [ "${SCAN_WARN:-0}" -gt 0 ]; then
+            warn "amdgpu 出现 ring 超时 / 页错误 ${SCAN_WARN} 条（最早 ${SCAN_FIRST}）"
+            show_samples
+            note "有“soft recovered”多为软恢复，但仍可能伴随卡顿/黑屏；若反复出现建议重启"
         else
-            note "Xid 记录: $codes（非严重码，通常是应用侧问题）"
+            ok "amdgpu 内核态干净：没有 GPU reset / ring 超时 / 页错误"
         fi
     fi
 }
@@ -352,10 +452,22 @@ check_memory() {
     else
         ok "内存充足"
     fi
-    if [ "$suse" -gt "$SWAP_WARN_MIB" ]; then
-        warn "交换已用 ${suse} MiB（> ${SWAP_WARN_MIB} MiB），系统在吃紧"
+
+    # SteamOS/Steam Deck 默认用 zram（压缩内存，不是磁盘 swap）：占用高是常态，
+    # 单看它容易误报，所以结合可用内存一起判断；真实 swap 仍按绝对阈值。
+    local swap_pct=0 swap_is_zram=0
+    [ "$stotal" -gt 0 ] && swap_pct=$((suse * 100 / stotal))
+    ls /sys/block/zram* >/dev/null 2>&1 && swap_is_zram=1
+    if [ "$swap_is_zram" = 1 ]; then
+        if [ "$suse" -gt "$SWAP_WARN_MIB" ] && [ "$avail" -lt "$RAM_MIN_MIB" ]; then
+            warn "zram 已用 ${suse} MiB 且可用内存只剩 ${avail} MiB → 内存压力大，建议先关程序/重启"
+        else
+            ok "zram（压缩交换）已用 ${suse} MiB（${swap_pct}%），配合可用内存看属正常"
+        fi
+    elif [ "$suse" -gt "$SWAP_WARN_MIB" ] || [ "$swap_pct" -ge 80 ]; then
+        warn "交换占用偏高：已用 ${suse} MiB（${swap_pct}%）"
     else
-        ok "交换占用正常"
+        ok "交换占用正常（已用 ${suse} MiB，${swap_pct}%）"
     fi
 }
 
@@ -415,11 +527,13 @@ check_vulkan() {
 }
 
 # ============================================================ 5. Steam 游戏
-# 输出每个快捷方式：appid \t 名称 \t Exe \t 启动目录 \t 启动项
+# 读某个 shortcuts.vdf，输出每个快捷方式：
+#   appid \t 名称 \t Exe \t 启动目录 \t 启动项
 list_shortcuts() {
-    [ -n "$SHORTCUTS_VDF" ] && [ -r "$SHORTCUTS_VDF" ] || return 0
+    local vdf="$1"
+    [ -n "$vdf" ] && [ -r "$vdf" ] || return 0
     have python3 || return 0          # 缺失时由 check_games 给出明确提示
-    python3 - "$SHORTCUTS_VDF" <<'PY' 2>/dev/null
+    python3 - "$vdf" <<'PY' 2>/dev/null
 import re, sys
 try:
     d = open(sys.argv[1], 'rb').read()
@@ -460,17 +574,19 @@ is_doorstop_dir() {
 }
 
 # 启动项 / 前缀注册表里是否已经给了 winhttp 原生优先（native 排在最前）
+# $1=Steam 根目录  $2=启动项  $3=appid
 has_winhttp_override() {
-    local opts="$1" appid="$2" reg
+    local root="$1" opts="$2" appid="$3" reg
     printf '%s' "$opts" | grep -qE 'WINEDLLOVERRIDES=.*winhttp=n' && return 0
-    reg="$STEAM_DIR/steamapps/compatdata/$appid/pfx/user.reg"
+    reg="$root/steamapps/compatdata/$appid/pfx/user.reg"
     [ -r "$reg" ] && grep -qE '"winhttp"="n' "$reg" && return 0
     return 1
 }
 
+# $1=Steam 根目录  $2=appid
 check_prefix() {
-    local appid="$1"
-    local cdir="$STEAM_DIR/steamapps/compatdata/$appid"
+    local root="$1" appid="$2"
+    local cdir="$root/steamapps/compatdata/$appid"
     if [ -z "$appid" ] || [ ! -d "$cdir" ]; then
         warn "还没有 Proton 前缀（compatdata/${appid:-?} 不存在）：先用 Proton 跑一次游戏再看"
         return
@@ -498,10 +614,11 @@ check_prefix() {
 }
 
 check_one_game() {
-    local appid="$1" name="$2" exe="$3" opts="$4"
+    local root="$1" appid="$2" name="$3" exe="$4" opts="$5"
     local dir; dir="$(exe_dir_of "$exe" 2>/dev/null || true)"
 
     info "游戏: ${name:-?}（appid ${appid:-?}）"
+    vnote "Steam: $root（$(steam_root_kind "$root")）"
     vnote "Exe: $exe"
     note "启动项: ${opts:-<空>}"
 
@@ -522,7 +639,7 @@ check_one_game() {
         else
             warn "缺少 doorstop_config.ini → Doorstop 无法启动"
         fi
-        if has_winhttp_override "$opts" "$appid"; then
+        if has_winhttp_override "$root" "$opts" "$appid"; then
             ok "已给 winhttp 原生优先（Proton 下注入器能加载）"
         else
             warn "启动项没给 winhttp 原生优先 → Proton 会用内置 winhttp，注入器不执行，汉化/Mod 失效"
@@ -538,65 +655,79 @@ check_one_game() {
         note "所以上面的“驱动内核态”与 vkd3d-proton 是否可用，直接决定它能否出画面"
     fi
 
-    check_prefix "$appid"
+    check_prefix "$root" "$appid"
 }
 
 check_games() {
-    if [ -z "$SHORTCUTS_VDF" ]; then
-        [ "$ALL_GAMES" = 1 ] || [ "$LIST_GAMES" = 1 ] || [ -n "$GAME_MATCH" ] || return 0
-        warn "找不到 Steam shortcuts.vdf（STEAM_DIR=$STEAM_DIR）"
-        note "非默认安装位置可用 STEAM_DIR=... 指定；Flatpak Steam 的位置已自动探测"
+    [ "$ALL_GAMES" = 1 ] || [ "$LIST_GAMES" = 1 ] || [ -n "$GAME_MATCH" ] || return 0
+    if [ "${STEAM_ROOTS[*]:-}" = "" ]; then
+        warn "没有找到任何 Steam 安装目录"
+        note "已探测：~/.local/share/Steam、~/.steam/steam、~/.steam/root、"
+        note "        Flatpak 的 ~/.var/app/com.valvesoftware.Steam/{data/Steam,.local/share/Steam}"
+        note "也可用 STEAM_DIR=/路径 手动指定"
         return
     fi
-    [ "$ALL_GAMES" = 1 ] || [ "$LIST_GAMES" = 1 ] || [ -n "$GAME_MATCH" ] || return 0
 
     sec "5. Steam 快捷方式"
     if ! have python3; then
         warn "没装 python3，无法解析 shortcuts.vdf → 跳过游戏侧检查（系统体检不受影响）"
         return
     fi
-    [ "$LIST_GAMES" = 1 ] && printf '  %-20s %-28s %s\n' "APPID" "名称" "注入链状态"
-    local appid name exe startdir opts n=0 ds_total=0 ds_bad=0
-    while IFS=$'\t' read -r appid name exe startdir opts; do
-        [ -z "${appid:-}" ] && continue
 
-        if [ "$LIST_GAMES" = 1 ]; then
-            local dir tag="-"
-            dir="$(exe_dir_of "$exe" 2>/dev/null || true)"
-            if is_doorstop_dir "$dir" 2>/dev/null; then
-                if has_winhttp_override "$opts" "$appid"; then tag="Doorstop/OK"
-                else tag="Doorstop/需修"; fi
-            fi
-            printf '  %-20s %-28s %s\n' "$appid" "${name:0:26}" "$tag"
-            n=$((n + 1))
+    local root vdf appid name exe startdir opts n=0 ds_total=0 ds_bad=0 roots_used=0
+    for root in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
+        if ! vdf="$(vdf_of_root "$root")"; then
+            vnote "跳过 $root（没有 shortcuts.vdf）"
             continue
         fi
+        roots_used=$((roots_used + 1))
+        note "Steam 根目录: $root（$(steam_root_kind "$root")）"
+        [ "$LIST_GAMES" = 1 ] && printf '  %-20s %-28s %s\n' "APPID" "名称" "注入链状态"
 
-        # --all-games：只关心有注入链风险的
-        if [ "$ALL_GAMES" = 1 ]; then
-            local dir2; dir2="$(exe_dir_of "$exe" 2>/dev/null || true)"
-            if is_doorstop_dir "$dir2" 2>/dev/null; then
-                ds_total=$((ds_total + 1))
-                if ! has_winhttp_override "$opts" "$appid"; then
-                    ds_bad=$((ds_bad + 1))
-                    warn "$name：Doorstop 注入器不会加载（启动项缺 winhttp=n,b）"
-                    note "  启动项: ${opts:-<空>}"
-                    note "  修法: 属性 → 启动选项 填 WINEDLLOVERRIDES=winhttp=n,b %command% <原有参数>"
+        while IFS=$'\t' read -r appid name exe startdir opts; do
+            [ -z "${appid:-}" ] && continue
+
+            if [ "$LIST_GAMES" = 1 ]; then
+                local dir tag="-"
+                dir="$(exe_dir_of "$exe" 2>/dev/null || true)"
+                if is_doorstop_dir "$dir" 2>/dev/null; then
+                    if has_winhttp_override "$root" "$opts" "$appid"; then tag="Doorstop/OK"
+                    else tag="Doorstop/需修"; fi
                 fi
+                printf '  %-20s %-28s %s\n' "$appid" "${name:0:26}" "$tag"
+                n=$((n + 1))
+                continue
             fi
-            n=$((n + 1))
-            continue
-        fi
 
-        # --game <关键词>
-        local blob="$name $exe $startdir"
-        if printf '%s' "$blob" | grep -qiF -- "$GAME_MATCH"; then
-            [ -z "$LAUNCH_APPID" ] && LAUNCH_APPID="$appid"
-            check_one_game "$appid" "$name" "$exe" "$opts"
-            n=$((n + 1))
-        fi
-    done <<<"$(list_shortcuts)"
-    vnote "共扫描 $n 条"
+            # --all-games：只关心有注入链风险的
+            if [ "$ALL_GAMES" = 1 ]; then
+                local dir2; dir2="$(exe_dir_of "$exe" 2>/dev/null || true)"
+                if is_doorstop_dir "$dir2" 2>/dev/null; then
+                    ds_total=$((ds_total + 1))
+                    if ! has_winhttp_override "$root" "$opts" "$appid"; then
+                        ds_bad=$((ds_bad + 1))
+                        warn "$name：Doorstop 注入器不会加载（启动项缺 winhttp=n,b）"
+                        note "  启动项: ${opts:-<空>}"
+                        note "  修法: 属性 → 启动选项 填 WINEDLLOVERRIDES=winhttp=n,b %command% <原有参数>"
+                    fi
+                fi
+                n=$((n + 1))
+                continue
+            fi
+
+            # --game <关键词>
+            local blob="$name $exe $startdir"
+            if printf '%s' "$blob" | grep -qiF -- "$GAME_MATCH"; then
+                if [ -z "$LAUNCH_APPID" ]; then
+                    LAUNCH_APPID="$appid"; LAUNCH_ROOT="$root"
+                fi
+                check_one_game "$root" "$appid" "$name" "$exe" "$opts"
+                n=$((n + 1))
+            fi
+        done <<<"$(list_shortcuts "$vdf")"
+    done
+
+    vnote "共扫描 $n 条快捷方式，来自 $roots_used 个 Steam 根目录"
     if [ "$ALL_GAMES" = 1 ]; then
         if [ "${ds_bad:-0}" -gt 0 ]; then
             info "共 ${ds_total:-0} 个 Doorstop 注入游戏，其中 ${ds_bad} 个启动项缺 winhttp=n,b（见上面告警）"
@@ -612,6 +743,15 @@ check_games() {
 }
 
 # ============================================================ 启动
+# 启动方式按 Steam 安装形态选择：
+#   · 原生 Steam（含 SteamOS 内置）→ steam -applaunch
+#   · Flatpak 版 Steam           → flatpak run com.valvesoftware.Steam -applaunch
+#   · 都不行                     → xdg-open steam://rungameid/<appid>（交给 URL 处理器）
+spawn() {
+    if have setsid; then setsid "$@" >/dev/null 2>&1 &
+    else "$@" >/dev/null 2>&1 & fi
+}
+
 maybe_launch() {
     [ "$DO_LAUNCH" = 1 ] || return 0
     if [ -z "$LAUNCH_APPID" ]; then
@@ -623,22 +763,42 @@ maybe_launch() {
         local a=""; read -r a || true
         case "$a" in y|Y|yes|YES) ;; *) echo "  已取消。"; return 0 ;; esac
     fi
-    if ! have steam; then
-        warn "找不到 steam 命令，请手动启动"
+
+    echo "  → 正在启动（appid $LAUNCH_APPID）…"
+    case "${LAUNCH_ROOT:-}" in
+        */.var/app/com.valvesoftware.Steam/*)
+            if have flatpak && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+                spawn flatpak run com.valvesoftware.Steam -applaunch "$LAUNCH_APPID"
+                return 0
+            fi
+            ;;
+    esac
+    if have steam; then
+        spawn steam -applaunch "$LAUNCH_APPID"
         return 0
     fi
-    echo "  → 正在启动（appid $LAUNCH_APPID）…"
-    if have setsid; then
-        setsid steam -applaunch "$LAUNCH_APPID" >/dev/null 2>&1 &
-    else
-        steam -applaunch "$LAUNCH_APPID" >/dev/null 2>&1 &
+    if have flatpak && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+        spawn flatpak run com.valvesoftware.Steam -applaunch "$LAUNCH_APPID"
+        return 0
     fi
+    if have xdg-open; then
+        spawn xdg-open "steam://rungameid/$LAUNCH_APPID"
+        return 0
+    fi
+    warn "找不到 steam / flatpak / xdg-open，请手动启动"
 }
 
 # ============================================================ 主流程
+# 识别系统（SteamOS 有专门提示）、探测所有 Steam 安装（原生 / SteamOS / Flatpak）
+_osid="$(awk -F= '/^ID=/{gsub(/"/, "", $2); print $2}' "$OS_RELEASE_FILE" 2>/dev/null)"
+case "$_osid" in steamos|steamdeck) IS_STEAMOS=1 ;; esac
+detect_steam_roots
+
 echo "GPU / Proton 启动前体检　$(date '+%F %T')"
-[ -n "$SHORTCUTS_VDF" ] && vnote "Steam userdata: $SHORTCUTS_VDF"
 [ -r "$CONF_FILE" ] && vnote "配置文件: $CONF_FILE"
+for _r in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
+    vnote "Steam: $_r（$(steam_root_kind "$_r")）"
+done
 
 # --list-games：只列快捷方式，不做系统体检（要体检就用 --all-games / --game）
 if [ "$LIST_GAMES" = 1 ]; then
@@ -657,9 +817,10 @@ check_games
 echo
 if [ "$CRITICAL" = 1 ]; then
     printf '%s✗ 结论：发现严重问题，先别启动。%s\n' "$C_RED" "$C_RST"
-    echo "  → 若是驱动 channel/GSP 损坏：请【重启电脑】（重置驱动内存池 / GPU VA 空间 / GSP / channel 池），"
-    echo "    重启后趁驱动干净直接玩，成功率最高。"
-    echo "  → 若是 nvidia-smi 不可用：多半是内核模块与用户态版本不一致，统一 nvidia 包后重启。"
+    echo "  → NVIDIA channel/GSP 损坏、或 AMD GPU reset 之后：请【重启电脑】"
+    echo "    （重启会重置驱动的内存池 / GPU VA 空间 / GSP / channel 池，或让 amdgpu 重新初始化）"
+    echo "  → 若是 nvidia-smi 不可用：多半是内核模块与用户态版本不一致，统一驱动包后重启"
+    [ "$IS_STEAMOS" = 1 ] && echo "  → SteamOS 是不可变系统：驱动随系统镜像更新，别手动改 /usr；必要时切 Beta 通道等修复"
     exit 2
 elif [ "$WARNINGS" -gt 0 ]; then
     printf '%s! 结论：有 %d 处警告，可以尝试启动，但建议先处理上面提示。%s\n' "$C_YEL" "$WARNINGS" "$C_RST"
