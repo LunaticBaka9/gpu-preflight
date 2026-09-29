@@ -23,6 +23,7 @@
 #    ./gpu-preflight.sh                        # 只体检系统
 #    ./gpu-preflight.sh --list-games            # 列出所有 Steam 快捷方式及风险
 #    ./gpu-preflight.sh --all-games             # 扫描所有快捷方式的注入链风险
+#    ./gpu-preflight.sh --debug-steam           # 诊断：账号目录/每个 vdf/解析条数（查"读不到游戏"用）
 #    ./gpu-preflight.sh --game 关键词           # 系统体检 + 该游戏检查（匹配名称/路径）
 #    ./gpu-preflight.sh --game 关键词 -l        # 检查通过后启动它（steam -applaunch）
 #    ./gpu-preflight.sh --game 关键词 -l -y     # 有警告也不询问，直接启动
@@ -39,7 +40,15 @@
 #        这样命令行环境变量依然优先。
 #        可用变量：VRAM_WARN_MIB、VRAM_WARN_PCT、RAM_MIN_MIB、SWAP_WARN_MIB、
 #                  JOURNAL_ARGS（默认 "-b -k"，可设 "-b -1 -k" 检查上一次开机）、
-#                  STEAM_DIR、STEAM_USERDATA、XID_SERIOUS、OS_RELEASE_FILE
+#                  STEAM_DIR、STEAM_USERDATA、STEAM_USER_HOME、XID_SERIOUS、
+#                  OS_RELEASE_FILE、FORCE_GPU
+#
+#  非 Steam 快捷方式（"右键 → 添加到 Steam"）：
+#    只存在 <Steam 根>/userdata/<账号 id>/config/shortcuts.vdf，脚本会：
+#      · 扫描所有 Steam 根（原生 / SteamOS / Flatpak）与**所有账号**，不只第一个账号
+#      · 用 sudo 运行时自动改用 SUDO_USER 的家目录（并兜底 /home/*），避免 $HOME=/root 找不到
+#      · 优先用 python3 解析；没有 python3 时用内置 coreutils 解析器（SteamOS/极简系统也能用）
+#      · 读不到时用 --debug-steam 打印账号目录、vdf 大小/时间、原始条目数与解析条数
 #
 #  发行版兼容性：
 #    · 需要 bash（用到进程替换 / here-string；bash 4+ 更稳）、coreutils、grep、awk、sed、
@@ -63,7 +72,9 @@
 #      （在只读根文件系统上同样可用）。
 #    · 可选依赖（缺了只跳过对应检查，不影响其它项）：
 #        nvidia-smi（NVIDIA 显存）、vulkaninfo/vulkan-tools（Vulkan 枚举）、lspci/pciutils（拓扑）、
-#        python3（解析 Steam shortcuts.vdf，只有 --game/--all-games/--list-games 需要）、
+#        python3（解析 Steam shortcuts.vdf 的**首选**实现；缺失时改用内置 coreutils 解析器，
+#                 后者需要 grep 支持 -b 与 od —— GNU 工具链都满足；Alpine 等 BusyBox-only
+#                 环境会明确提示"请安装 python3"，不会静默失败）、
 #        timeout（coreutils，给 vulkaninfo 加超时）、steam / flatpak / xdg-open（仅 -l 启动用）。
 #    · 平台范围：NVIDIA 与 AMD/amdgpu 驱动检查都支持；Intel 平台仍做内存与 Vulkan 检查，
 #      驱动专属项会明确提示"未检测到"。
@@ -79,6 +90,7 @@ set -uo pipefail
 STEAM_DIR="${STEAM_DIR:-}"
 STEAM_USERDATA="${STEAM_USERDATA:-}"
 STEAM_ROOTS=()                 # 探测到的所有 Steam 根目录（去重、真实路径）
+STEAM_KEYS=()                  # 去重用（userdata 的真实路径）
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 FORCE_GPU="${FORCE_GPU:-auto}"      # auto（默认）| nvidia | amd：强制走某个驱动分支（调试/特殊环境）
 IS_STEAMOS=0
@@ -105,22 +117,53 @@ CONF_FILE="${GPU_PREFLIGHT_CONF:-$HOME/.config/gpu-preflight.conf}"
 [ -r "$CONF_FILE" ] && . "$CONF_FILE"
 
 # 探测所有 Steam 根目录（去重；.steam/steam 常是指向 .local/share/Steam 的软链）
+#
+# 说明：非 Steam 快捷方式（"右键 → 添加到 Steam"）只存在于
+#   <Steam 根>/userdata/<账号 id>/config/shortcuts.vdf
+# 所以这里只要发现 userdata 或 steamapps 任一存在就当作 Steam 根（新装/只放库的目录
+# 可能还没有 steamapps，但 shortcuts.vdf 已经存在）。
+#
+# 用 sudo 运行时 $HOME 会变成 /root，导致找不到 Steam；这里优先用 SUDO_USER 的家目录，
+# 并兜底扫 /home/*（只有 root 读得到别人的家目录）。
+steam_homes() {
+    local h
+    if [ -n "${STEAM_USER_HOME:-}" ]; then printf '%s\n' "$STEAM_USER_HOME"
+    elif [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        h="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: '{print $6}')"
+        [ -n "$h" ] && printf '%s\n' "$h" || printf '%s\n' "$HOME"
+    else
+        printf '%s\n' "$HOME"
+    fi
+    # root 兜底：别人的家目录（/home/*），便于 sudo 场景
+    if [ "$(id -u)" = 0 ]; then
+        for h in /home/*; do [ -d "$h" ] && printf '%s\n' "$h"; done
+    fi
+}
+
 detect_steam_roots() {
-    local cand real seen
-    for cand in "$STEAM_DIR" \
-                "$HOME/.local/share/Steam" \
-                "$HOME/.steam/steam" \
-                "$HOME/.steam/root" \
-                "$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
-                "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
-        [ -n "$cand" ] || continue
-        [ -d "$cand/steamapps" ] || continue
-        real="$(readlink -f "$cand" 2>/dev/null || printf '%s' "$cand")"
-        for seen in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
-            [ "$seen" = "$real" ] && continue 2
+    local h cand real key seen
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        for cand in "$STEAM_DIR" \
+                    "$h/.local/share/Steam" \
+                    "$h/.steam/steam" \
+                    "$h/.steam/root" \
+                    "$h/.steam/debian-installation" \
+                    "$h/.var/app/com.valvesoftware.Steam/data/Steam" \
+                    "$h/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+            [ -n "$cand" ] || continue
+            [ -d "$cand/userdata" ] || [ -d "$cand/steamapps" ] || continue
+            real="$(readlink -f "$cand" 2>/dev/null || printf '%s' "$cand")"
+            # 去重键用 userdata 的真实路径：~/.steam/steam 常是真实目录 + 内部软链，
+            # 只比较目录本身会把同一份 userdata 扫两遍
+            key="$(readlink -f "$cand/userdata" 2>/dev/null || printf '%s' "$real")"
+            for seen in ${STEAM_KEYS[@]+"${STEAM_KEYS[@]}"}; do
+                [ "$seen" = "$key" ] && continue 2
+            done
+            STEAM_KEYS+=("$key")
+            STEAM_ROOTS+=("$real")
         done
-        STEAM_ROOTS+=("$real")
-    done
+    done <<<"$(steam_homes)"
 }
 
 # 给根目录打标签（输出用）
@@ -131,17 +174,93 @@ steam_root_kind() {
     esac
 }
 
-# 取某个根目录下的 shortcuts.vdf（可用 STEAM_USERDATA 指定账号）
-vdf_of_root() {
+# 列出某个根目录下所有账号的 shortcuts.vdf（不是只取第一个！）
+# 一个 Steam 根下可能有 userdata/0 与 userdata/<数字 SteamID> 多个账号，
+# 只取第一个会漏掉真正有快捷方式的那个账号。
+vdfs_of_root() {
     local root="$1" d
-    if [ -n "$STEAM_USERDATA" ] && [ -r "$root/userdata/$STEAM_USERDATA/config/shortcuts.vdf" ]; then
-        printf '%s/userdata/%s/config/shortcuts.vdf' "$root" "$STEAM_USERDATA"
+    if [ -n "$STEAM_USERDATA" ]; then
+        d="$root/userdata/$STEAM_USERDATA/config/shortcuts.vdf"
+        [ -r "$d" ] && printf '%s\n' "$d"
         return 0
     fi
     for d in "$root"/userdata/*/config/shortcuts.vdf; do
-        [ -r "$d" ] && { printf '%s' "$d"; return 0; }
+        [ -r "$d" ] && printf '%s\n' "$d"
     done
-    return 1
+    return 0
+}
+
+# 纯 coreutils 的 shortcuts.vdf 解析（python3 缺失时用；BusyBox 工具也能跑）
+#
+# 二进制 VDF 的结构：每个键以类型字节开头（\x01=字符串 \x02=int32），键名以 \0 结尾；
+# 字符串键后面紧跟以 \0 结尾的值；int32 键后面是 4 字节小端整数。
+# 这里不用 python3 的做法：
+#   · appid ：grep -abo 找到 "appid" 的字节偏移，再从 偏移+6 读 4 字节小端整数
+#   · 字符串：同样找键名偏移，校验前一个字节是 0x01、后一个字节是 0x00，
+#             然后用 dd 取值、tr 把 \0 换成换行、sed 取第一行
+# UTF-8 全程按字节传递，不依赖 locale。
+bs_vdf_field_offsets() {
+    local vdf="$1" key="$2" off prev next
+    grep -abo -- "$key" "$vdf" 2>/dev/null | while IFS=: read -r off _; do
+        prev="$(od -An -tu1 -j $((off - 1)) -N 1 "$vdf" 2>/dev/null | tr -d ' ')"
+        next="$(od -An -tu1 -j $((off + ${#key})) -N 1 "$vdf" 2>/dev/null | tr -d ' ')"
+        [ "$prev" = "1" ] && [ "$next" = "0" ] && printf '%s\n' "$off"
+    done
+}
+
+bs_vdf_strings() {
+    local vdf="$1" key="$2" off
+    bs_vdf_field_offsets "$vdf" "$key" | while IFS= read -r off; do
+        dd if="$vdf" bs=1 skip=$((off + ${#key} + 1)) count=4096 2>/dev/null \
+            | tr '\0' '\n' | sed -n 1p
+    done
+}
+
+bs_vdf_appids() {
+    local vdf="$1" off
+    grep -abo -- 'appid' "$vdf" 2>/dev/null | while IFS=: read -r off _; do
+        dd if="$vdf" bs=1 skip=$((off + 6)) count=4 2>/dev/null | od -An -tu4 | tr -d ' '
+    done
+}
+
+# 纯 coreutils 解析器是否可用：需要 grep 支持 -b（字节偏移）与 od
+#   · SteamOS / Arch / Debian / Fedora 等 GNU 工具链：可用 ✓
+#   · Alpine 等 BusyBox-only 环境：grep 没有 -b，od 也可能没有 → 明确提示装 python3
+BS_PARSER_OK=""
+bs_parser_ready() {
+    [ -n "$BS_PARSER_OK" ] && { [ "$BS_PARSER_OK" = 1 ]; return; }
+    BS_PARSER_OK=0
+    if have grep && have od && have dd; then
+        local probe="${TMPDIR:-/tmp}/gpu-preflight.probe.$$"
+        printf 'x' > "$probe" 2>/dev/null
+        if grep -abo x "$probe" >/dev/null 2>&1; then BS_PARSER_OK=1; fi
+        rm -f "$probe" 2>/dev/null
+    fi
+    [ "$BS_PARSER_OK" = 1 ]
+}
+
+list_shortcuts_bs() {
+    local vdf="$1" tmp
+    if ! bs_parser_ready; then
+        warn "无 python3，且本机 grep 不支持 -b 或缺 od → 无法解析 shortcuts.vdf" >&2
+        warn "请安装 python3（推荐），或改用 GNU grep + GNU coreutils（od）" >&2
+        return 1
+    fi
+    # 用带模板的 mktemp（BusyBox 的 mktemp 要求模板），失败再退回 mkdir
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/gpu-preflight.vdf.XXXXXX" 2>/dev/null)" || tmp=""
+    if [ -z "$tmp" ]; then
+        tmp="${TMPDIR:-/tmp}/gpu-preflight.vdf.$$"
+        mkdir -p "$tmp" 2>/dev/null || return 1
+    fi
+    bs_vdf_appids "$vdf"                                     > "$tmp/appid"
+    bs_vdf_strings "$vdf" AppName                            > "$tmp/name"
+    bs_vdf_strings "$vdf" Exe                                > "$tmp/exe"
+    bs_vdf_strings "$vdf" StartDir                           > "$tmp/start"
+    bs_vdf_strings "$vdf" LaunchOptions                      > "$tmp/opts"
+
+    # 用 paste 按行拼起来；某列比别的短时 paste 会补空，正好容错
+    paste -d '\t' "$tmp/appid" "$tmp/name" "$tmp/exe" "$tmp/start" "$tmp/opts" 2>/dev/null
+    rm -rf "$tmp" 2>/dev/null
 }
 
 # ----------------------------------------------------------------- 运行状态
@@ -155,6 +274,7 @@ ASSUME_YES=0
 QUIET=0
 VERBOSE=0
 SKIP_VULKAN=0
+DEBUG_STEAM=0
 LAUNCH_APPID=""
 LAUNCH_ROOT=""
 
@@ -191,6 +311,7 @@ while [ $# -gt 0 ]; do
         -q|--quiet)    QUIET=1 ;;
         -v|--verbose)  VERBOSE=1 ;;
         --no-vulkan)   SKIP_VULKAN=1 ;;
+        --debug-steam) DEBUG_STEAM=1 ;;
         --no-color)    C_RED=; C_GRN=; C_YEL=; C_CYA=; C_DIM=; C_RST= ;;
         -h|--help)     usage ;;
         *) echo "未知参数: $1（-h 看帮助）" >&2; exit 64 ;;
@@ -532,7 +653,12 @@ check_vulkan() {
 list_shortcuts() {
     local vdf="$1"
     [ -n "$vdf" ] && [ -r "$vdf" ] || return 0
-    have python3 || return 0          # 缺失时由 check_games 给出明确提示
+    # 有 python3 就用 python3（更快更好读）；没有就用内置的 coreutils 解析器
+    # （SteamOS / 极简发行版上 python3 可能不存在，这样也不会漏掉非 Steam 快捷方式）
+    if ! have python3; then
+        list_shortcuts_bs "$vdf"
+        return 0
+    fi
     python3 - "$vdf" <<'PY' 2>/dev/null
 import re, sys
 try:
@@ -662,72 +788,88 @@ check_games() {
     [ "$ALL_GAMES" = 1 ] || [ "$LIST_GAMES" = 1 ] || [ -n "$GAME_MATCH" ] || return 0
     if [ "${STEAM_ROOTS[*]:-}" = "" ]; then
         warn "没有找到任何 Steam 安装目录"
-        note "已探测：~/.local/share/Steam、~/.steam/steam、~/.steam/root、"
-        note "        Flatpak 的 ~/.var/app/com.valvesoftware.Steam/{data/Steam,.local/share/Steam}"
-        note "也可用 STEAM_DIR=/路径 手动指定"
+        note "已探测：\$HOME/.local/share/Steam、\$HOME/.steam/{steam,root,debian-installation}、"
+        note "        Flatpak 的 \$HOME/.var/app/com.valvesoftware.Steam/{data/Steam,.local/share/Steam}"
+        note "可用 STEAM_DIR=/路径 手动指定；用 sudo 跑会按 SUDO_USER 的家目录找；"
+        note "--debug-steam 可看详细探测过程"
         return
     fi
 
     sec "5. Steam 快捷方式"
     if ! have python3; then
-        warn "没装 python3，无法解析 shortcuts.vdf → 跳过游戏侧检查（系统体检不受影响）"
-        return
+        info "没有 python3 → 使用内置 coreutils 解析器读 shortcuts.vdf（功能相同，速度稍慢）"
     fi
 
-    local root vdf appid name exe startdir opts n=0 ds_total=0 ds_bad=0 roots_used=0
+    local root vdf acct appid name exe startdir opts n=0 ds_total=0 ds_bad=0 roots_used=0 vdfs_seen=0
     for root in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
-        if ! vdf="$(vdf_of_root "$root")"; then
-            vnote "跳过 $root（没有 shortcuts.vdf）"
-            continue
-        fi
-        roots_used=$((roots_used + 1))
         note "Steam 根目录: $root（$(steam_root_kind "$root")）"
-        [ "$LIST_GAMES" = 1 ] && printf '  %-20s %-28s %s\n' "APPID" "名称" "注入链状态"
 
-        while IFS=$'\t' read -r appid name exe startdir opts; do
-            [ -z "${appid:-}" ] && continue
+        local any_vdf=0
+        while IFS= read -r vdf; do
+            [ -n "$vdf" ] || continue
+            any_vdf=1
+            vdfs_seen=$((vdfs_seen + 1))
+            acct="$(basename "$(dirname "$(dirname "$vdf")")")"
+            local rows cnt
+            rows="$(list_shortcuts "$vdf")"
+            cnt="$(printf '%s\n' "$rows" | grep -c . || true)"
+            note "  账号 $acct：$cnt 条快捷方式（$vdf）"
+            [ "$cnt" = 0 ] && continue
+            roots_used=$((roots_used + 1))
+            [ "$LIST_GAMES" = 1 ] && printf '  %-20s %-28s %s\n' "APPID" "名称" "注入链状态"
 
-            if [ "$LIST_GAMES" = 1 ]; then
-                local dir tag="-"
-                dir="$(exe_dir_of "$exe" 2>/dev/null || true)"
-                if is_doorstop_dir "$dir" 2>/dev/null; then
-                    if has_winhttp_override "$root" "$opts" "$appid"; then tag="Doorstop/OK"
-                    else tag="Doorstop/需修"; fi
-                fi
-                printf '  %-20s %-28s %s\n' "$appid" "${name:0:26}" "$tag"
-                n=$((n + 1))
-                continue
-            fi
+            while IFS=$'\t' read -r appid name exe startdir opts; do
+                # 只跳过完全空的记录（appid 允许为空，便于解析器降级时仍能列出游戏）
+                [ -z "${name}${exe}${opts}" ] && continue
 
-            # --all-games：只关心有注入链风险的
-            if [ "$ALL_GAMES" = 1 ]; then
-                local dir2; dir2="$(exe_dir_of "$exe" 2>/dev/null || true)"
-                if is_doorstop_dir "$dir2" 2>/dev/null; then
-                    ds_total=$((ds_total + 1))
-                    if ! has_winhttp_override "$root" "$opts" "$appid"; then
-                        ds_bad=$((ds_bad + 1))
-                        warn "$name：Doorstop 注入器不会加载（启动项缺 winhttp=n,b）"
-                        note "  启动项: ${opts:-<空>}"
-                        note "  修法: 属性 → 启动选项 填 WINEDLLOVERRIDES=winhttp=n,b %command% <原有参数>"
+                if [ "$LIST_GAMES" = 1 ]; then
+                    local dir tag="-"
+                    dir="$(exe_dir_of "$exe" 2>/dev/null || true)"
+                    if is_doorstop_dir "$dir" 2>/dev/null; then
+                        if has_winhttp_override "$root" "$opts" "$appid"; then tag="Doorstop/OK"
+                        else tag="Doorstop/需修"; fi
                     fi
+                    printf '  %-20s %-28s %s\n' "$appid" "${name:0:26}" "$tag"
+                    n=$((n + 1))
+                    continue
                 fi
-                n=$((n + 1))
-                continue
-            fi
 
-            # --game <关键词>
-            local blob="$name $exe $startdir"
-            if printf '%s' "$blob" | grep -qiF -- "$GAME_MATCH"; then
-                if [ -z "$LAUNCH_APPID" ]; then
-                    LAUNCH_APPID="$appid"; LAUNCH_ROOT="$root"
+                # --all-games：只关心有注入链风险的
+                if [ "$ALL_GAMES" = 1 ]; then
+                    local dir2; dir2="$(exe_dir_of "$exe" 2>/dev/null || true)"
+                    if is_doorstop_dir "$dir2" 2>/dev/null; then
+                        ds_total=$((ds_total + 1))
+                        if ! has_winhttp_override "$root" "$opts" "$appid"; then
+                            ds_bad=$((ds_bad + 1))
+                            warn "$name：Doorstop 注入器不会加载（启动项缺 winhttp=n,b）"
+                            note "  启动项: ${opts:-<空>}"
+                            note "  修法: 属性 → 启动选项 填 WINEDLLOVERRIDES=winhttp=n,b %command% <原有参数>"
+                        fi
+                    fi
+                    n=$((n + 1))
+                    continue
                 fi
-                check_one_game "$root" "$appid" "$name" "$exe" "$opts"
-                n=$((n + 1))
-            fi
-        done <<<"$(list_shortcuts "$vdf")"
+
+                # --game <关键词>
+                local blob="$name $exe $startdir"
+                if printf '%s' "$blob" | grep -qiF -- "$GAME_MATCH"; then
+                    if [ -z "$LAUNCH_APPID" ]; then
+                        LAUNCH_APPID="$appid"; LAUNCH_ROOT="$root"
+                    fi
+                    check_one_game "$root" "$appid" "$name" "$exe" "$opts"
+                    n=$((n + 1))
+                fi
+            done <<<"$rows"
+        done <<<"$(vdfs_of_root "$root")"
+
+        if [ "$any_vdf" = 0 ]; then
+            warn "$root 下没有找到 shortcuts.vdf（非 Steam 快捷方式就存在这里）"
+            note "  目录 $root/userdata 内容：$(ls "$root/userdata" 2>/dev/null | tr '\n' ' ')"
+            note "  如果你用 sudo 运行：脚本已尝试 SUDO_USER 的家目录；也可 STEAM_USERDATA=<数字> 指定账号"
+        fi
     done
 
-    vnote "共扫描 $n 条快捷方式，来自 $roots_used 个 Steam 根目录"
+    vnote "共扫描 $n 条快捷方式，来自 $roots_used 个账号 / $vdfs_seen 个 shortcuts.vdf"
     if [ "$ALL_GAMES" = 1 ]; then
         if [ "${ds_bad:-0}" -gt 0 ]; then
             info "共 ${ds_total:-0} 个 Doorstop 注入游戏，其中 ${ds_bad} 个启动项缺 winhttp=n,b（见上面告警）"
@@ -738,8 +880,48 @@ check_games() {
         fi
     fi
     if [ "$ALL_GAMES" = 0 ] && [ "$LIST_GAMES" = 0 ] && [ "$n" = 0 ]; then
-        warn "没有匹配 \"$GAME_MATCH\" 的快捷方式（用 --list-games 看全部）"
+        warn "没有匹配 \"$GAME_MATCH\" 的快捷方式（用 --list-games 看全部；--debug-steam 看解析过程）"
     fi
+}
+
+# ============================================================ Steam 诊断
+# 用来看清楚"为什么没检测到快捷方式"：账号目录、每个 vdf 的大小/时间/条目数、
+# 以及两种解析器（python3 / coreutils）各自解析出多少条。
+debug_steam() {
+    [ "$DEBUG_STEAM" = 1 ] || return 0
+    sec "Steam 诊断（--debug-steam）"
+
+    note "当前用户: $(id -un 2>/dev/null)（uid=$(id -u)）　HOME=$HOME　SUDO_USER=${SUDO_USER:-<无>}"
+    note "Steam shortcuts.vdf 解析器: $(have python3 && printf 'python3（优先）' || printf '内置 coreutils（无 python3）')"
+
+    if [ "${STEAM_ROOTS[*]:-}" = "" ]; then
+        warn "一个 Steam 根目录都没探测到"
+        note "候选路径：\$HOME/.local/share/Steam、\$HOME/.steam/{steam,root,debian-installation}、"
+        note "          Flatpak 的 \$HOME/.var/app/com.valvesoftware.Steam/{data/Steam,.local/share/Steam}"
+        note "可用 STEAM_DIR=/路径 手动指定；用 sudo 跑时会自动按 SUDO_USER 的家目录找"
+        return
+    fi
+
+    local root vdf raw cnt
+    for root in ${STEAM_ROOTS[@]+"${STEAM_ROOTS[@]}"}; do
+        note "根目录: $root（$(steam_root_kind "$root")）"
+        note "  steamapps: $([ -d "$root/steamapps" ] && printf 有 || printf 无)　userdata: $([ -d "$root/userdata" ] && printf 有 || printf 无)"
+        [ -d "$root/userdata" ] && note "  账号目录: $(ls "$root/userdata" 2>/dev/null | tr '\n' ' ')"
+
+        local any=0
+        while IFS= read -r vdf; do
+            [ -n "$vdf" ] || continue
+            any=1
+            raw="$(grep -abo -- 'appid' "$vdf" 2>/dev/null | grep -c . || true)"
+            cnt="$(list_shortcuts "$vdf" | grep -c . || true)"
+            note "  vdf: $vdf"
+            note "       大小 $(wc -c < "$vdf" 2>/dev/null) 字节　改于 $(date -r "$vdf" '+%F %T' 2>/dev/null)"
+            note "       原始条目数(appid 出现次数)=$raw　解析出=$cnt"
+            [ "$raw" != "$cnt" ] && warn "  解析条数与原始条数不一致，可能解析器有问题（请把这段发我）"
+        done <<<"$(vdfs_of_root "$root")"
+        [ "$any" = 0 ] && note "  （这个根目录下没有 shortcuts.vdf）"
+    done
+    note "多账号时可用 STEAM_USERDATA=<数字> 只看某个账号；非 Steam 快捷方式只存在 shortcuts.vdf 里"
 }
 
 # ============================================================ 启动
@@ -803,6 +985,7 @@ done
 # --list-games：只列快捷方式，不做系统体检（要体检就用 --all-games / --game）
 if [ "$LIST_GAMES" = 1 ]; then
     check_games
+    debug_steam
     echo
     echo "提示：--all-games 会对有注入链风险的快捷方式告警；--game <关键词> 做单游戏完整检查。"
     exit 0
@@ -813,6 +996,7 @@ check_driver
 check_memory
 check_vulkan
 check_games
+debug_steam
 
 echo
 if [ "$CRITICAL" = 1 ]; then

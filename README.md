@@ -20,6 +20,7 @@ Linux 游戏启动前体检（NVIDIA / AMD / SteamOS / Proton / Flatpak Steam）
 ./gpu-preflight.sh                        # 只体检系统
 ./gpu-preflight.sh --list-games            # 列出所有 Steam 快捷方式及风险
 ./gpu-preflight.sh --all-games             # 扫描所有快捷方式的注入链风险
+./gpu-preflight.sh --debug-steam           # 诊断：账号目录/每个 vdf/解析条数（查"读不到游戏"用）
 ./gpu-preflight.sh --game 关键词           # 系统体检 + 该游戏检查（匹配名称/路径）
 ./gpu-preflight.sh --game 关键词 -l        # 检查通过后启动它
 ./gpu-preflight.sh --game 关键词 -l -y     # 有警告也不询问，直接启动
@@ -73,9 +74,20 @@ GPU reset、MES 无响应、ring 超时、页错误之后，本次开机内经�
 | `JOURNAL_ARGS` | `-b -k` | 内核日志范围，可设 `-b -1 -k` 检查上一次开机 |
 | `STEAM_DIR` | 自动探测 | 指定后只扫这一个 Steam 根目录 |
 | `STEAM_USERDATA` | 自动探测 | 指定 userdata 数字目录（多账号） |
+| `STEAM_USER_HOME` | 自动探测 | 指定 Steam 用户的家目录（sudo/容器场景） |
 | `XID_SERIOUS` | `48 56 62 74 79 94 95 109 119 120` | 视为严重的 Xid 码 |
 | `OS_RELEASE_FILE` | `/etc/os-release` | 调试/容器用 |
 | `FORCE_GPU` | `auto` | `auto` / `nvidia` / `amd`，强制走某个驱动分支 |
+
+## 非 Steam 快捷方式（右键 → 添加到 Steam）
+
+这类游戏不写在 `steamapps`，只存在于 `<Steam 根>/userdata/<账号 id>/config/shortcuts.vdf`。脚本为此做了：
+
+* **扫描所有 Steam 根**（原生 / SteamOS / Flatpak）**与所有账号**，不只取第一个——SteamOS/Deck 上 `userdata/` 里常有 `0` 这个目录，只取第一个会读到空文件，结果"一个游戏都检测不到"
+* **sudo 场景**：用 `sudo` 运行时 `$HOME` 会变成 `/root`，脚本会自动改用 `SUDO_USER` 的家目录，并兜底扫 `/home/*`（也可用 `STEAM_USER_HOME=` 指定）
+* **不依赖 python3**：有 python3 就用（更快），没有则用内置的 coreutils 解析器（`grep -b` + `dd` + `od`），SteamOS / Arch / Debian / Fedora 等 GNU 工具链都能跑；解析结果与 python3 路径完全一致
+* **读不到时用 `--debug-steam`**：打印当前用户/HOME/SUDO_USER、每个根目录、每个账号目录、每个 vdf 的大小与修改时间、**原始条目数（appid 出现次数）vs 解析出的条数**，一眼看出卡在哪一步
+* 注意：Alpine 等 BusyBox-only 环境里 `grep` 没有 `-b`，此时脚本会明确提示"请安装 python3"而不是静默失败
 
 ## SteamOS / Steam Deck 支持
 
@@ -97,5 +109,5 @@ GPU reset、MES 无响应、ring 超时、页错误之后，本次开机内经�
 * 需要 bash（用到进程替换 / here-string；bash 4+ 更稳）、coreutils、grep、awk、sed、sort、uniq、cut、tr。awk 只用 POSIX 特性，gawk / mawk(Debian) / BusyBox awk(Alpine) 都能跑
 * 内核日志：有 systemd 就用 `journalctl`（支持 `-b` / `-b -1` 看上一次开机）；没有 systemd（Void、Artix、Alpine 等）自动退回 `dmesg` —— 非 root 读 dmesg 需要 `kernel.dmesg_restrict=0`，否则该项会提示「没做」（不代表有问题）
 * 读的都是内核标准接口（`/proc/driver/nvidia`、`/proc/meminfo`、`/sys/class/drm`、`/etc/os-release`），所以 Debian/Ubuntu、Fedora/RHEL、Arch/CachyOS、openSUSE、Alpine、SteamOS 都能用；检查的可执行文件只按「命令是否存在」判断，不依赖任何包管理器
-* 可选依赖（缺了只跳过对应检查，不影响其它项）：`nvidia-smi`、`vulkaninfo`(vulkan-tools)、`lspci`(pciutils)、`python3`（解析 `shortcuts.vdf`，只有 `--game`/`--all-games`/`--list-games` 需要）、`timeout`、`steam` / `flatpak` / `xdg-open`（仅 `-l` 启动用）
+* 可选依赖（缺了只跳过对应检查，不影响其它项）：`nvidia-smi`、`vulkaninfo`(vulkan-tools)、`lspci`(pciutils)、`python3`（**可选**：解析 `shortcuts.vdf` 的首选实现，缺失时用内置 coreutils 解析器）、`timeout`、`steam` / `flatpak` / `xdg-open`（仅 `-l` 启动用）
 * 平台范围：NVIDIA 与 AMD/amdgpu 驱动检查都支持；Intel 平台仍做内存与 Vulkan 检查，驱动专属项会明确提示「未检测到」
